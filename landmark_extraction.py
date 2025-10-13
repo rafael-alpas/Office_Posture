@@ -1,107 +1,134 @@
+import argparse
 import os
+from pathlib import Path
+
 import cv2
 import mediapipe as mp
 import pandas as pd
 from tqdm import tqdm
 
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=True)
+# Default locations keep parity with the original workflow.
+DEFAULT_DATASET_ROOT = "yolov5/Posture_Dataset"
+DEFAULT_OUTPUT = "landmarks_dataset.csv"
 
-def extract_landmarks(image_path):
-    """Extracts 33 pose landmarks (x,y,z,visibility) from an image"""
-    image = cv2.imread(image_path)
+# Reuse a single static-image pose estimator to avoid repeated initialisation.
+mp_pose = mp.solutions.pose
+POSE_STATIC = mp_pose.Pose(static_image_mode=True)
+
+
+def extract_landmarks(image_path: Path):
+    """
+    Run MediaPipe Pose on one image and return the flat landmark vector.
+    Returns None when the pose is not detected or the file cannot be read.
+    """
+    image = cv2.imread(str(image_path))
     if image is None:
-        print(f"⚠️ Skipping unreadable image: {image_path}")
+        print(f"[WARN] Skipping unreadable image: {image_path}")
         return None
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = pose.process(image_rgb)
+    results = POSE_STATIC.process(image_rgb)
 
-    if results.pose_landmarks:
-        row = []
-        for lm in results.pose_landmarks.landmark:
-            row.extend([lm.x, lm.y, lm.z, lm.visibility])
-        return row
-    return None
+    if not results.pose_landmarks:
+        return None
+
+    row = []
+    for landmark in results.pose_landmarks.landmark:
+        row.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
+    return row
 
 
-def process_dataset(dataset_root, output_csv):
+def process_dataset(dataset_root: Path, output_csv: Path):
     """
-    Reads YOLO dataset structure:
-    dataset_root/
-        train/
-            images/
-            labels/
-        valid/
-            images/
-            labels/
+    Traverse a YOLO-style dataset and extract pose landmarks for each image.
     """
+    # Convert incoming paths to Path objects for convenience.
+    dataset_root = Path(dataset_root)
+    output_csv = Path(output_csv)
+
+    # Process train/valid splits; test is inference-only.
+    splits = ["train", "valid"]
     data = []
     seen_files = set()
 
-    for split in ["train", "valid"]:
-        img_dir = os.path.join(dataset_root, split, "images")
-        lbl_dir = os.path.join(dataset_root, split, "labels")
+    for split in splits:
+        img_dir = dataset_root / split / "images"
+        lbl_dir = dataset_root / split / "labels"
 
-        if not os.path.exists(img_dir) or not os.path.exists(lbl_dir):
-            print(f"⚠️ Missing {split} folder structure (expected images/ & labels/). Skipping...")
+        if not img_dir.exists() or not lbl_dir.exists():
+            print(f"[WARN] Missing {split} folder structure (expected images/ & labels/). Skipping...")
             continue
 
-        for fname in tqdm(os.listdir(img_dir), desc=f"Processing {split} set"):
-            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+        for image_path in tqdm(sorted(img_dir.glob("*")), desc=f"Processing {split} set"):
+            # Skip non-image files (e.g., caches).
+            if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
                 continue
 
-            image_path = os.path.join(img_dir, fname)
-            label_path = os.path.join(lbl_dir, os.path.splitext(fname)[0] + ".txt")
-
-            if not os.path.exists(label_path):
-                print(f"⚠️ Missing label for {fname}, skipping...")
+            label_path = lbl_dir / f"{image_path.stem}.txt"
+            if not label_path.exists():
+                print(f"[WARN] Missing label for {image_path.name}, skipping...")
                 continue
 
-            if fname in seen_files:
-                print(f"⚠️ Duplicate file skipped: {fname}")
+            if image_path.name in seen_files:
+                print(f"[WARN] Duplicate file skipped: {image_path.name}")
                 continue
-            seen_files.add(fname)
+            seen_files.add(image_path.name)
 
             try:
-                with open(label_path, "r") as f:
-                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                with label_path.open("r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
                 if not lines:
-                    print(f"⚠️ Empty label file: {fname}")
+                    print(f"[WARN] Empty label file: {image_path.name}")
                     continue
                 class_id = int(lines[0].split()[0])
-                if class_id not in [0, 1]:
-                    print(f"⚠️ Unexpected class ID ({class_id}) in {fname}, skipping...")
+                if class_id not in (0, 1):
+                    print(f"[WARN] Unexpected class ID ({class_id}) in {image_path.name}, skipping...")
                     continue
-            except Exception as e:
-                print(f"⚠️ Error reading label for {fname}: {e}")
+            except Exception as exc:
+                print(f"[WARN] Error reading label for {image_path.name}: {exc}")
                 continue
 
             class_name = "bad_posture" if class_id == 0 else "good_posture"
             landmarks = extract_landmarks(image_path)
             if landmarks:
-                data.append([split, class_name, class_id, fname] + landmarks)
+                data.append([split, class_name, class_id, image_path.name] + landmarks)
             else:
-                print(f"⚠️ No landmarks found in {fname}, skipping...")
+                print(f"[WARN] No landmarks found in {image_path.name}, skipping...")
 
-    # Build dataframe
-    cols = ["split", "class_name", "label", "filename"]
-    for i in range(33):
-        cols += [f"x{i}", f"y{i}", f"z{i}", f"v{i}"]
+    # Prepare the header: metadata columns + 33 (x, y, z, visibility) blocks.
+    columns = ["split", "class_name", "label", "filename"]
+    for idx in range(33):
+        columns += [f"x{idx}", f"y{idx}", f"z{idx}", f"v{idx}"]
 
-    df = pd.DataFrame(data, columns=cols)
-
+    df = pd.DataFrame(data, columns=columns)
     if df.empty:
-        print("❌ No data extracted! Please check dataset paths and Mediapipe setup.")
+        print("[ERROR] No data extracted! Please check dataset paths and Mediapipe setup.")
         return
 
-    # Save cleaned dataframe
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
-    print(f"\n✅ Saved landmark dataset to {output_csv}")
-    print(f"📊 Shape: {df.shape}")
-    print("🔍 Class distribution:")
-    print(df['class_name'].value_counts())
+    print(f"[INFO] Saved landmark dataset to {output_csv}")
+    print(f"[INFO] Shape: {df.shape}")
+    print("[INFO] Class distribution:")
+    print(df["class_name"].value_counts())
 
 
-# Example usage
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Extract MediaPipe pose landmarks from a YOLO-format dataset."
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=DEFAULT_DATASET_ROOT,
+        help="Root directory containing train/valid folders (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output",
+        default=DEFAULT_OUTPUT,
+        help="CSV file path for extracted landmarks (default: %(default)s)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    process_dataset("yolov5/Posture_Dataset", "landmarks_dataset.csv")
+    args = parse_args()
+    process_dataset(Path(args.dataset_root), Path(args.output))
