@@ -4,6 +4,8 @@ import warnings
 from collections import Counter, deque
 from pathlib import Path
 import math
+import textwrap
+from typing import Dict, List, Optional
 
 # Suppress noisy future warnings from dependencies to keep logs readable.
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -34,6 +36,107 @@ POSE_STREAM = mp_pose.Pose(
 )
 
 
+# Camera orientation presets adjust tilt interpretation for different viewpoints.
+CAMERA_ORIENTATION_CONFIG: Dict[str, Dict[str, float]] = {
+    "front": {"offset": 0.0, "sign": 1.0},
+    "north": {"offset": 0.0, "sign": 1.0},
+    "northwest": {"offset": -15.0, "sign": -1.0},
+    "side": {"offset": -90.0, "sign": -1.0},
+}
+
+# Preferred landmark order when estimating head direction.
+HEAD_REFERENCE_ORDER: Dict[str, tuple[int, ...]] = {
+    "front": (7, 8, 0),
+    "north": (7, 8, 0),
+    "northwest": (7, 0, 8),
+    "side": (7, 0, 8),
+}
+
+VISIBILITY_MIN = 0.2
+COORD_MARGIN = 0.35
+SPINE_TILT_NEUTRAL_DEG = 15.0
+HEAD_TILT_NEUTRAL_DEG = 10.0
+OVERLAY_SMOOTH_ALPHA = 0.75
+PIXEL_CATCHUP_DISTANCE = 20.0
+ANGLE_MAX_STEP = 8.0
+ANGLE_CATCHUP_THRESHOLD = 22.5
+OVERLAY_MISSING_FRAMES = 8
+MIN_SEGMENT_PIXELS = 6.0
+ANGLE_MEDIAN_WINDOW = 5
+
+
+def normalize_angle(angle: float) -> float:
+    """Wrap angle into [-180, 180] for clearer comparisons."""
+    while angle <= -180.0:
+        angle += 360.0
+    while angle > 180.0:
+        angle -= 360.0
+    return angle
+
+
+def adjust_for_camera(angle: float, orientation: str, offset_override: Optional[float] = None) -> float:
+    """Apply camera orientation correction to align tilt direction."""
+    config = CAMERA_ORIENTATION_CONFIG.get(orientation, {"offset": 0.0, "sign": 1.0})
+    offset = config["offset"] if offset_override is None else offset_override
+    signed = (angle + offset) * config.get("sign", 1.0)
+    return normalize_angle(signed)
+
+
+def weighted_point(
+    landmarks,
+    indices,
+    min_vis: float = VISIBILITY_MIN,
+    margin: float = COORD_MARGIN,
+) -> Optional[np.ndarray]:
+    """Return visibility-weighted average of the given landmark indices."""
+    coords = []
+    weights = []
+    for idx in indices:
+        lm = landmarks[idx]
+        if lm.visibility >= VISIBILITY_MIN:
+            if -margin <= lm.x <= 1.0 + margin and -margin <= lm.y <= 1.0 + margin:
+                coords.append([
+                    float(np.clip(lm.x, 0.0, 1.0)),
+                    float(np.clip(lm.y, 0.0, 1.0)),
+                    lm.z,
+                ])
+                weights.append(max(lm.visibility, 1e-3))
+    if not coords:
+        return None
+    coords = np.array(coords)
+    weights = np.array(weights)
+    weighted = np.average(coords, axis=0, weights=weights)
+    return weighted
+
+
+def estimate_body_yaw(landmarks, min_vis: float = VISIBILITY_MIN) -> Optional[float]:
+    """Approximate subject yaw using shoulders first, then hips if shoulders fail."""
+    pairs = [(11, 12), (23, 24)]
+    for left_idx, right_idx in pairs:
+        left = landmarks[left_idx]
+        right = landmarks[right_idx]
+        if left.visibility >= min_vis and right.visibility >= min_vis:
+            dx = right.x - left.x
+            dz = right.z - left.z
+            if abs(dx) < 1e-5 and abs(dz) < 1e-5:
+                continue
+            return math.degrees(math.atan2(dz, dx))
+    return None
+
+
+def build_feedback(avg_spine_tilt: Optional[float], avg_head_tilt: Optional[float]) -> List[str]:
+    """Generate adaptive guidance lines based on observed tilt severities."""
+    tips: List[str] = []
+    if avg_head_tilt is not None and avg_head_tilt > HEAD_TILT_NEUTRAL_DEG:
+        tips.append("Try lifting your chin and aligning your ears with your shoulders.")
+    if avg_spine_tilt is not None and avg_spine_tilt > SPINE_TILT_NEUTRAL_DEG:
+        tips.append("Straighten your spine and keep your shoulders back.")
+    if not tips:
+        tips.append("Posture looks balanced - keep it up!")
+    return tips
+
+
+
 def create_tracker():
     """Return a CSRT tracker instance when OpenCV supports it."""
     if hasattr(cv2, "TrackerCSRT_create"):
@@ -55,48 +158,283 @@ def extract_landmarks(image):
     return np.array(lm).reshape(1, -1), results.pose_landmarks
 
 
-def draw_pose_overlay(image, landmarks, label):
-    """Overlay key joints and spine tilt vector for visual feedback."""
+def draw_pose_overlay(
+    image,
+    landmarks,
+    label,
+    orientation,
+    offset_override,
+    overlay_state,
+    smooth_alpha=OVERLAY_SMOOTH_ALPHA,
+):
+    """Overlay key joints plus spine and head tilt vectors for visual feedback."""
     h, w, _ = image.shape
     pts = landmarks.landmark
 
-    def point(idx):
-        return (int(pts[idx].x * w), int(pts[idx].y * h))
+    def point_px(idx: int) -> tuple[int, int]:
+        lm = pts[idx]
+        return int(lm.x * w), int(lm.y * h)
 
-    for idx in [11, 12, 23, 24]:
-        cv2.circle(image, point(idx), 5, (0, 255, 255), -1)
+    for key in (
+        "mid_shoulder",
+        "mid_hip",
+        "ear_mid",
+        "spine_start_px",
+        "spine_end_px",
+        "head_start_px",
+        "head_end_px",
+    ):
+        overlay_state.setdefault(key, None)
+    overlay_state.setdefault("spine_missing", OVERLAY_MISSING_FRAMES)
+    overlay_state.setdefault("head_missing", OVERLAY_MISSING_FRAMES)
+    overlay_state.setdefault("spine_angle", None)
+    overlay_state.setdefault("head_angle", None)
+    if "spine_angle_history" not in overlay_state:
+        overlay_state["spine_angle_history"] = deque(maxlen=ANGLE_MEDIAN_WINDOW)
+    if "head_angle_history" not in overlay_state:
+        overlay_state["head_angle_history"] = deque(maxlen=ANGLE_MEDIAN_WINDOW)
 
-    cv2.line(image, point(11), point(12), (255, 255, 255), 2)
-    cv2.line(image, point(23), point(24), (255, 255, 255), 2)
+    for idx in (11, 12, 23, 24, 7, 8):
+        lm = pts[idx]
+        if lm.visibility >= VISIBILITY_MIN:
+            cv2.circle(image, point_px(idx), 5, (0, 255, 255), -1)
 
-    mid_shoulder = ((pts[11].x + pts[12].x) / 2, (pts[11].y + pts[12].y) / 2)
-    mid_hip = ((pts[23].x + pts[24].x) / 2, (pts[23].y + pts[24].y) / 2)
+    def as_point2(raw):
+        if raw is None:
+            return None
+        return np.array(raw[:2], dtype=np.float32)
 
-    dx = mid_shoulder[0] - mid_hip[0]
-    dy = mid_shoulder[1] - mid_hip[1]
-    angle = math.degrees(math.atan2(dy, dx))
+    def smooth_point(key, new_point):
+        prev = overlay_state.get(key)
+        if new_point is None:
+            return prev
+        new_arr = np.array(new_point, dtype=np.float32)
+        if prev is None:
+            overlay_state[key] = new_arr
+            return new_arr
+        dist = np.linalg.norm(new_arr - prev)
+        if dist >= PIXEL_CATCHUP_DISTANCE:
+            overlay_state[key] = new_arr
+            return new_arr
+        smoothed = prev * smooth_alpha + new_arr * (1.0 - smooth_alpha)
+        overlay_state[key] = smoothed
+        return smoothed
 
-    if abs(angle) > 15:
-        color = (0, 0, 255)
-    elif label == "good_posture":
-        color = (0, 255, 0)
-    else:
-        color = (0, 255, 255)
+    def smooth_px(key, new_point):
+        if new_point is None:
+            prev = overlay_state.get(key)
+            return prev if isinstance(prev, np.ndarray) else None
+        new_arr = np.array(new_point, dtype=np.float32)
+        prev = overlay_state.get(key)
+        if prev is None or not isinstance(prev, np.ndarray):
+            overlay_state[key] = new_arr
+            return new_arr
+        dist = np.linalg.norm(new_arr - prev)
+        if dist >= PIXEL_CATCHUP_DISTANCE:
+            overlay_state[key] = new_arr
+            return new_arr
+        smoothed = prev * smooth_alpha + new_arr * (1.0 - smooth_alpha)
+        overlay_state[key] = smoothed
+        return smoothed
 
-    direction = "Lean Back" if dx > 0 else "Lean Forward"
-    start = (int(mid_hip[0] * w), int(mid_hip[1] * h))
-    end = (int(mid_shoulder[0] * w), int(mid_shoulder[1] * h))
-    cv2.arrowedLine(image, start, end, color, 3, tipLength=0.3)
-    cv2.putText(
-        image,
-        f"Tilt: {angle:.1f} deg {direction}",
-        (start[0], start[1] - 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        color,
-        2,
-    )
-    return angle
+    def to_px(point):
+        if point is None:
+            return None
+        x = np.clip(point[0], 0.0, 1.0) * w
+        y = np.clip(point[1], 0.0, 1.0) * h
+        return np.array([x, y], dtype=np.float32)
+
+    def to_int_tuple(arr):
+        if arr is None:
+            return None
+        return tuple(np.round(arr).astype(int))
+
+    def contract_segment(start_px, end_px, pad_px, prev_start_key, prev_end_key):
+        start_arr = np.array(start_px, dtype=np.float32)
+        end_arr = np.array(end_px, dtype=np.float32)
+        vec = end_arr - start_arr
+        length = np.linalg.norm(vec)
+        if length <= MIN_SEGMENT_PIXELS:
+            prev_start = overlay_state.get(prev_start_key)
+            prev_end = overlay_state.get(prev_end_key)
+            if isinstance(prev_start, np.ndarray) and isinstance(prev_end, np.ndarray):
+                return prev_start, prev_end
+            return None
+        direction = vec / max(length, 1e-4)
+        adj_start = start_arr + direction * pad_px
+        adj_end = end_arr - direction * pad_px
+        return adj_start, adj_end
+
+    def smooth_angle_value(key, angle):
+        if angle is None:
+            return overlay_state.get(key)
+        prev = overlay_state.get(key)
+        if prev is None:
+            overlay_state[key] = angle
+            return angle
+        delta = normalize_angle(angle - prev)
+        if abs(delta) >= ANGLE_CATCHUP_THRESHOLD:
+            overlay_state[key] = angle
+            return angle
+        delta = max(-ANGLE_MAX_STEP, min(ANGLE_MAX_STEP, delta))
+        smoothed = normalize_angle(prev + delta)
+        overlay_state[key] = smoothed
+        return smoothed
+
+    def update_angle_history(key, angle):
+        history = overlay_state[key]
+        if angle is None:
+            return history[-1] if history else None
+        history.append(angle)
+        return float(np.median(np.array(history, dtype=np.float32)))
+
+    def compute_vertical(a, b):
+        if a is None or b is None:
+            return None
+        return normalize_angle(math.degrees(math.atan2(a[1] - b[1], a[0] - b[0])) + 90.0)
+
+    mid_shoulder_raw = as_point2(weighted_point(pts, [11, 12]))
+    mid_hip_raw = as_point2(weighted_point(pts, [23, 24]))
+
+    head_order = HEAD_REFERENCE_ORDER.get(orientation, (7, 8, 0))
+    ear_mid_raw = None
+    for idx in head_order:
+        lm = pts[idx]
+        if lm.visibility >= VISIBILITY_MIN and -COORD_MARGIN <= lm.x <= 1.0 + COORD_MARGIN and -COORD_MARGIN <= lm.y <= 1.0 + COORD_MARGIN:
+            ear_mid_raw = np.array([np.clip(lm.x, 0.0, 1.0), np.clip(lm.y, 0.0, 1.0)], dtype=np.float32)
+            break
+    if ear_mid_raw is None:
+        ear_mid_raw = as_point2(weighted_point(pts, list(dict.fromkeys(head_order))))
+
+    mid_shoulder = smooth_point("mid_shoulder", mid_shoulder_raw)
+    mid_hip = smooth_point("mid_hip", mid_hip_raw)
+    ear_mid = smooth_point("ear_mid", ear_mid_raw)
+
+    raw_spine_available = mid_shoulder_raw is not None and mid_hip_raw is not None
+    raw_head_available = ear_mid_raw is not None and mid_shoulder_raw is not None
+
+    overlay_state["spine_missing"] = 0 if raw_spine_available else min(OVERLAY_MISSING_FRAMES, overlay_state["spine_missing"] + 1)
+    overlay_state["head_missing"] = 0 if raw_head_available else min(OVERLAY_MISSING_FRAMES, overlay_state["head_missing"] + 1)
+
+    if overlay_state["spine_missing"] >= OVERLAY_MISSING_FRAMES:
+        overlay_state["spine_start_px"] = None
+        overlay_state["spine_end_px"] = None
+        overlay_state["spine_angle_history"].clear()
+        overlay_state["spine_angle"] = None
+    if overlay_state["head_missing"] >= OVERLAY_MISSING_FRAMES:
+        overlay_state["head_start_px"] = None
+        overlay_state["head_end_px"] = None
+        overlay_state["head_angle_history"].clear()
+        overlay_state["head_angle"] = None
+
+    yaw_estimate = estimate_body_yaw(pts)
+
+    metrics = {
+        "spine_tilt_raw": None,
+        "spine_tilt": None,
+        "spine_direction": "No data",
+        "head_tilt_raw": None,
+        "head_tilt": None,
+        "head_direction": "No data",
+        "yaw": yaw_estimate,
+        "spine_visible": mid_shoulder is not None and mid_hip is not None,
+        "head_visible": ear_mid is not None and mid_shoulder is not None,
+        "spine_measured": raw_spine_available,
+        "head_measured": raw_head_available,
+        "spine_drawn": False,
+        "head_drawn": False,
+    }
+
+    def update_segment(raw_start, raw_end, start_key, end_key, pad_px):
+        if raw_start is None or raw_end is None:
+            return
+        start_px = to_px(raw_start)
+        end_px = to_px(raw_end)
+        if start_px is None or end_px is None:
+            return
+        contracted = contract_segment(start_px, end_px, pad_px, start_key, end_key)
+        if contracted is None:
+            return
+        overlay_state[start_key] = smooth_px(start_key, contracted[0])
+        overlay_state[end_key] = smooth_px(end_key, contracted[1])
+
+    update_segment(mid_hip_raw, mid_shoulder_raw, "spine_start_px", "spine_end_px", pad_px=10.0)
+    update_segment(mid_shoulder_raw, ear_mid_raw, "head_start_px", "head_end_px", pad_px=8.0)
+
+    metrics["spine_tilt_raw"] = compute_vertical(mid_shoulder_raw, mid_hip_raw)
+    metrics["head_tilt_raw"] = compute_vertical(ear_mid_raw, mid_shoulder_raw)
+
+    if metrics["spine_tilt_raw"] is not None:
+        candidate = adjust_for_camera(metrics["spine_tilt_raw"], orientation, offset_override)
+        candidate = update_angle_history("spine_angle_history", candidate)
+        spine_angle = smooth_angle_value("spine_angle", candidate)
+        metrics["spine_tilt"] = spine_angle
+        if spine_angle is not None:
+            if spine_angle > 5:
+                metrics["spine_direction"] = "Lean Forward"
+            elif spine_angle < -5:
+                metrics["spine_direction"] = "Lean Back"
+            else:
+                metrics["spine_direction"] = "Neutral"
+
+    if metrics["head_tilt_raw"] is not None:
+        candidate = adjust_for_camera(metrics["head_tilt_raw"], orientation, offset_override)
+        candidate = update_angle_history("head_angle_history", candidate)
+        head_angle = smooth_angle_value("head_angle", candidate)
+        metrics["head_tilt"] = head_angle
+        if head_angle is not None:
+            if head_angle > 5:
+                metrics["head_direction"] = "Head Forward"
+            elif head_angle < -5:
+                metrics["head_direction"] = "Head Back"
+            else:
+                metrics["head_direction"] = "Neutral"
+
+    spine_start_draw = to_int_tuple(overlay_state["spine_start_px"])
+    spine_end_draw = to_int_tuple(overlay_state["spine_end_px"])
+    if spine_start_draw and spine_end_draw and metrics["spine_tilt"] is not None:
+        metrics["spine_drawn"] = True
+        angle = metrics["spine_tilt"]
+        if abs(angle) > SPINE_TILT_NEUTRAL_DEG:
+            spine_color = (0, 0, 255)
+        elif label == "good_posture":
+            spine_color = (0, 255, 0)
+        else:
+            spine_color = (0, 255, 255)
+        cv2.arrowedLine(image, spine_start_draw, spine_end_draw, spine_color, 3, tipLength=0.3)
+        cv2.putText(
+            image,
+            f"Spine: {angle:.1f} deg {metrics['spine_direction']}",
+            (spine_start_draw[0], max(20, spine_start_draw[1] - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            spine_color,
+            2,
+        )
+
+    head_start_draw = to_int_tuple(overlay_state["head_start_px"])
+    head_end_draw = to_int_tuple(overlay_state["head_end_px"])
+    if head_start_draw and head_end_draw and metrics["head_tilt"] is not None:
+        metrics["head_drawn"] = True
+        angle = metrics["head_tilt"]
+        if abs(angle) <= HEAD_TILT_NEUTRAL_DEG:
+            head_color = (0, 140, 255)
+        else:
+            head_color = (0, 69, 255)
+        cv2.arrowedLine(image, head_start_draw, head_end_draw, head_color, 2, tipLength=0.25)
+        cv2.circle(image, head_end_draw, 4, head_color, -1)
+        cv2.putText(
+            image,
+            f"Head: {angle:.1f} deg {metrics['head_direction']}",
+            (head_end_draw[0], max(20, head_end_draw[1] - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            head_color,
+            2,
+        )
+
+    metrics["tracking_lost"] = not (metrics["spine_drawn"] or metrics["head_drawn"])
+    return metrics
 
 
 def draw_posture_bar(frame, good_count, bad_count):
@@ -241,6 +579,18 @@ def parse_args():
         default=0.1,
         help="Extra padding around the landmark-derived box when refinement is enabled.",
     )
+    parser.add_argument(
+        "--camera-angle",
+        default="front",
+        choices=sorted(CAMERA_ORIENTATION_CONFIG.keys()),
+        help="Camera orientation preset used to correct tilt direction.",
+    )
+    parser.add_argument(
+        "--camera-offset",
+        type=float,
+        default=None,
+        help="Manual tilt offset in degrees (applied after the preset).",
+    )
     return parser.parse_args()
 
 
@@ -267,8 +617,14 @@ def run_inference(args):
     print("[INFO] Loading Scaler...")
     scaler = joblib.load(args.scaler_path)
 
+    orientation = args.camera_angle.lower()
+    offset_override = args.camera_offset
+
     print("\n--- Starting Inference ---\n")
-    # Keep a short history of predicted labels to debounce frame-by-frame noise.
+    print(f"[INFO] Camera angle correction mode: {orientation}")
+    if offset_override is not None:
+        print(f"[INFO] Using manual tilt offset override: {offset_override:.2f} deg")
+
     recent_preds = deque(maxlen=args.recent_window)
     preds_video = Counter()
     total_predictions = Counter()
@@ -289,7 +645,6 @@ def run_inference(args):
         (frame_width, frame_height),
     )
 
-    # Tracker state is optional and only used when --use-tracker is enabled.
     tracker = None
     tracking = False
     reinit_interval = int(fps * args.tracker_reinit_secs) if args.tracker_reinit_secs > 0 else 0
@@ -297,11 +652,12 @@ def run_inference(args):
     lost_frames = 0
     frame_idx = 0
     results = []
-    # Diagnostics helpers capture detection coverage and box stability.
+    overlay_state: Dict[str, Optional[np.ndarray]] = {}
+
     frame_area = frame_width * frame_height
     frames_with_box = 0
     frames_with_yolo = 0
-    box_areas = []
+    box_areas: List[float] = []
     loss_streak = 0
     max_loss_streak = 0
 
@@ -387,6 +743,7 @@ def run_inference(args):
                 current_box = smoothed_box
             else:
                 smoothed_box = None
+                overlay_state.clear()
                 recent_preds.clear()
                 if args.use_tracker:
                     tracking = False
@@ -403,7 +760,6 @@ def run_inference(args):
             loss_streak = 0
             frames_with_box += 1
 
-        # EMA keeps boxes steady while still reacting slowly to new detections.
         if smoothed_box is None:
             smoothed_box = current_box
         else:
@@ -439,6 +795,7 @@ def run_inference(args):
 
         person = frame[y1:y2, x1:x2].copy()
         if person.size == 0:
+            overlay_state.clear()
             draw_posture_bar(
                 annotated,
                 preds_video.get("good_posture", 0),
@@ -449,6 +806,7 @@ def run_inference(args):
 
         lm, raw_landmarks = extract_landmarks(person)
         if lm is None:
+            overlay_state.clear()
             draw_posture_bar(
                 annotated,
                 preds_video.get("good_posture", 0),
@@ -458,7 +816,6 @@ def run_inference(args):
             continue
 
         if args.refine_with_landmarks and raw_landmarks:
-            # Use shoulders/hips/knees landmarks to tighten the crop around the torso.
             key_indices = [11, 12, 13, 14, 23, 24, 25, 26]
             xs = [raw_landmarks.landmark[i].x for i in key_indices if 0.0 <= raw_landmarks.landmark[i].x <= 1.0]
             ys = [raw_landmarks.landmark[i].y for i in key_indices if 0.0 <= raw_landmarks.landmark[i].y <= 1.0]
@@ -528,8 +885,27 @@ def run_inference(args):
         total_predictions[label] += 1
 
         color = (0, 255, 0) if label == "good_posture" else (0, 0, 255)
-        angle = draw_pose_overlay(person, raw_landmarks, label)
+        metrics = draw_pose_overlay(
+            person,
+            raw_landmarks,
+            label,
+            orientation,
+            offset_override,
+            overlay_state,
+        )
+        angle = metrics.get("spine_tilt")
         annotated[y1:y2, x1:x2] = person
+
+        if metrics.get("tracking_lost"):
+            cv2.putText(
+                annotated,
+                "Subject out of view",
+                (50, frame_height - 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 215, 255),
+                2,
+            )
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
@@ -548,6 +924,19 @@ def run_inference(args):
                 "label": label,
                 "confidence": conf_posture,
                 "tilt_angle": angle,
+                "tilt_angle_raw": metrics.get("spine_tilt_raw"),
+                "head_tilt_angle": metrics.get("head_tilt"),
+                "head_tilt_raw": metrics.get("head_tilt_raw"),
+                "spine_direction": metrics.get("spine_direction"),
+                "head_direction": metrics.get("head_direction"),
+                "yaw_estimate": metrics.get("yaw"),
+                "tracking_lost": metrics.get("tracking_lost", False),
+                "spine_visible": metrics.get("spine_visible", False),
+                "head_visible": metrics.get("head_visible", False),
+                "spine_measured": metrics.get("spine_measured", False),
+                "head_measured": metrics.get("head_measured", False),
+                "spine_drawn": metrics.get("spine_drawn", False),
+                "head_drawn": metrics.get("head_drawn", False),
             }
         )
 
@@ -572,6 +961,29 @@ def run_inference(args):
     avg_box_area = float(np.mean(box_areas)) if box_areas else 0.0
     std_box_area = float(np.std(box_areas)) if box_areas else 0.0
 
+    spine_tilts = [r["tilt_angle"] for r in results if r.get("tilt_angle") is not None]
+    head_tilts = [r["head_tilt_angle"] for r in results if r.get("head_tilt_angle") is not None]
+    spine_tilts_raw = [r["tilt_angle_raw"] for r in results if r.get("tilt_angle_raw") is not None]
+    head_tilts_raw = [r["head_tilt_raw"] for r in results if r.get("head_tilt_raw") is not None]
+    yaw_values = [r["yaw_estimate"] for r in results if r.get("yaw_estimate") is not None]
+    tracking_lost_frames = sum(1 for r in results if r.get("tracking_lost"))
+    tracking_lost_rate = tracking_lost_frames / frame_idx if frame_idx else 0.0
+
+    avg_spine_tilt_signed = float(np.mean(spine_tilts)) if spine_tilts else None
+    avg_spine_tilt = float(np.mean(np.abs(spine_tilts))) if spine_tilts else None
+    avg_head_tilt_signed = float(np.mean(head_tilts)) if head_tilts else None
+    avg_head_tilt = float(np.mean(np.abs(head_tilts))) if head_tilts else None
+    avg_spine_tilt_raw = float(np.mean(np.abs(spine_tilts_raw))) if spine_tilts_raw else None
+    avg_head_tilt_raw = float(np.mean(np.abs(head_tilts_raw))) if head_tilts_raw else None
+    avg_yaw = float(np.mean(yaw_values)) if yaw_values else None
+
+    feedback_lines = build_feedback(avg_spine_tilt, avg_head_tilt)
+    if bad_pct > 50:
+        feedback_lines.insert(0, f"Poor posture detected in {bad_pct}% of frames.")
+    elif bad_pct > 20:
+        feedback_lines.insert(0, f"Posture inconsistencies noted ({bad_pct}% bad frames).")
+    feedback_text = "\n".join(feedback_lines)
+
     diagnostics = {
         "video": str(video_path),
         "frames_total": frame_idx,
@@ -582,6 +994,16 @@ def run_inference(args):
         "avg_box_area_fraction": avg_box_area,
         "std_box_area_fraction": std_box_area,
         "max_consecutive_missing": max_loss_streak,
+        "frames_tracking_lost": tracking_lost_frames,
+        "tracking_lost_rate": tracking_lost_rate,
+        "avg_spine_tilt_deg": avg_spine_tilt,
+        "avg_spine_tilt_signed_deg": avg_spine_tilt_signed,
+        "avg_spine_tilt_raw_deg": avg_spine_tilt_raw,
+        "avg_head_tilt_deg": avg_head_tilt,
+        "avg_head_tilt_signed_deg": avg_head_tilt_signed,
+        "avg_head_tilt_raw_deg": avg_head_tilt_raw,
+        "avg_yaw_deg": avg_yaw,
+        "feedback": feedback_lines,
         "params": {
             "yolo_conf": args.yolo_conf,
             "yolo_iou": args.yolo_iou,
@@ -595,6 +1017,8 @@ def run_inference(args):
             "max_lost": args.max_lost,
             "refine_with_landmarks": args.refine_with_landmarks,
             "landmark_margin": args.landmark_margin,
+            "camera_angle": orientation,
+            "camera_offset": offset_override,
         },
     }
     diag_path = result_dir / f"{video_path.stem}_diagnostics.json"
@@ -610,6 +1034,12 @@ def run_inference(args):
         else:
             print(f"  - {key}: {value}")
     print(f"[INFO] Diagnostics JSON saved at: {diag_path}")
+
+    feedback_path = result_dir / f"{video_path.stem}_feedback.txt"
+    with feedback_path.open("w", encoding="utf-8") as f:
+        if feedback_text:
+            f.write(feedback_text + "\n")
+    print(f"[INFO] Adaptive feedback saved at: {feedback_path}")
 
     summary = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
     cv2.putText(
@@ -649,20 +1079,19 @@ def run_inference(args):
         2,
     )
 
-    tip = (
-        "Poor posture detected often, please adjust!" if bad_pct > 50
-        else "Mostly good posture!" if bad_pct > 20
-        else "Excellent posture maintained!"
-    )
-    cv2.putText(
-        summary,
-        tip,
-        (50, 280),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (255, 255, 0),
-        2,
-    )
+    feedback_y = 260
+    for line in feedback_lines:
+        for chunk in textwrap.wrap(line, width=48) or [""]:
+            cv2.putText(
+                summary,
+                chunk,
+                (50, feedback_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (255, 255, 0),
+                2,
+            )
+            feedback_y += 35
 
     for _ in range(int(fps * 3)):
         writer.write(summary)
