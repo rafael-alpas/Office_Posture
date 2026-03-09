@@ -17,4 +17,4 @@ bad and good posture detection in a office setting
 
 8. Run infer video.py
 
-9. See results
+9. See results [ART_Prototype.pdf](https://github.com/user-attachments/files/25836738/ART_Prototype.pdf)
