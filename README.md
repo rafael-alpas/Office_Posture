@@ -36,7 +36,7 @@ The model was trained on a custom-curated dataset and achieved significant stabi
 ![Posture 2](./posture2.png)
 
 ## 📁 Prototype Document
-[📄 Prototype](https://github.com/user-attachments/files/25836738/ART_Prototype.pdf)
+[📄 Prototype](./Prototype.pdf)
 
 ## 📁 Full Documentation
 [📄 Download Full Documentation](./Office_Posture-Thesis.pdf)
