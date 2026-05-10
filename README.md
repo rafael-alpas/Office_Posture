@@ -10,6 +10,7 @@ A deep learning-based computer vision system designed to mitigate Musculoskeleta
 [![YOLOv5](https://img.shields.io/badge/YOLOv5-00A6ED?style=for-the-badge&logo=yolo&logoColor=white)](https://github.com/ultralytics/ultralytics)
 ![Pandas](https://img.shields.io/badge/pandas-%23150458.svg?style=for-the-badge&logo=pandas&logoColor=white)
 ![NumPy](https://img.shields.io/badge/numpy-%23013243.svg?style=for-the-badge&logo=numpy&logoColor=white)
+[![MediaPipe](https://img.shields.io/badge/MediaPipe-008080?style=for-the-badge&logo=google&logoColor=white)](https://google.github.io/mediapipe/)
 
 ## 🚀 Key Features
 * **Monitoring:** Video stream analysis with immediate feedback.
