@@ -1,26 +1,42 @@
-# Office_Posture
-bad and good posture detection in a office setting
+# 🪑 Machine Learning-Based Sitting Posture Recognition for Prolonged Use of Technology in Office Environments
+A deep learning-based computer vision system designed to mitigate Musculoskeletal Disorders (MSDs) by monitoring office sitting posture. This project utilizes a hybrid approach combining **YOLOv5** for person detection and **MediaPipe** for precise skeletal landmark extraction.
 
-1. Requires Pyton 3.11
+## 🛠️ Tech Stack
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-FF6F00?style=for-the-badge&logo=tensorflow&logoColor=white)](https://www.tensorflow.org/)
+[![OpenCV](https://img.shields.io/badge/OpenCV-4.x-5C3EE8?style=for-the-badge&logo=opencv&logoColor=white)](https://opencv.org/)
+![Keras](https://img.shields.io/badge/Keras-%23D00000.svg?style=for-the-badge&logo=Keras&logoColor=white)
+![TensorFlow](https://img.shields.io/badge/TensorFlow-%23FF6F00.svg?style=for-the-badge&logo=TensorFlow&logoColor=white)
+[![YOLOv5](https://img.shields.io/badge/YOLOv5-00A6ED?style=for-the-badge&logo=yolo&logoColor=white)](https://github.com/ultralytics/ultralytics)
+![Pandas](https://img.shields.io/badge/pandas-%23150458.svg?style=for-the-badge&logo=pandas&logoColor=white)
+![NumPy](https://img.shields.io/badge/numpy-%23013243.svg?style=for-the-badge&logo=numpy&logoColor=white)
 
-2. Install requirements.txt
+## 🚀 Key Features
+* **Monitoring:** Video stream analysis with immediate feedback.
+* **Hybrid Architecture:** Combines object detection (YOLOv5) with pose estimation (MediaPipe) for high-fidelity coordinate tracking.
+* **Optimized Classification:** Uses a Deep Neural Network (DNN) optimized with **L2 Regularization** and **Batch Normalization** to prevent overfitting.
+* **Actionable Feedback:** Categorizes posture into "Proper" or "Improper" with high confidence scores.
 
-3. Clone yolov5 from github
+## 🏗️ Methodology
+The system follows a multi-stage pipeline to ensure accuracy despite varying backgrounds or lighting:
 
-4. Make sure to have the Posture_Dataset ready
+1.  **Image Acquisition:** Captures frames from a video.
+2.  **Detection & Pose Estimation:** YOLOv5 identifies the user, while MediaPipe extracts key body landmarks (focusing on the torso, shoulders, and head).
+3.  **Coordinate Normalization:** Landmark data is scaled to maintain consistency regardless of the user's distance from the camera.
+4.  **Classification:** A trained model processes the landmarks to determine posture quality.
 
-5. Edit code to fit right directories of output and input
+## 📊 Model Performance
+The model was trained on a custom-curated dataset and achieved significant stability through hyperparameter tuning:
 
-6. Run landmark_extraction.py
+* **Model Accuracy:** ~89.71%
+* **Model Loss:** ~29.82%
 
-7. Run train.py
+## 📸 Sample Images
+![Posture 1](./posture1.png)
+![Posture 2](./posture2.png)
 
-8. Run infer video.py
+## 📁 Prototype Document
+[📄 Prototype](https://github.com/user-attachments/files/25836738/ART_Prototype.pdf)
 
-9. See results [ART_Prototype.pdf](https://github.com/user-attachments/files/25836738/ART_Prototype.pdf)
-10. Sample IMG:
-
-
-
-
-<img width="633" height="550" alt="sample_img" src="https://github.com/user-attachments/assets/e9000945-ec21-40eb-8564-47145513063a" />
+## 📁 Full Documentation
+[📄 Download Full Documentation](./Office_Posture-Thesis.pdf)
